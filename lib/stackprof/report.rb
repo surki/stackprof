@@ -70,9 +70,12 @@ module StackProf
     def print_stackcollapse
       raise "profile does not include raw samples (add `raw: true` to collecting StackProf.run)" unless raw = data[:raw]
 
-      while len = raw.shift
-        frames = raw.slice!(0, len)
-        weight = raw.shift
+      curr_index = 0
+      while len = raw[curr_index]
+        curr_index += 1
+        frames = raw[curr_index, len]
+        weight = raw[curr_index + len + 1]
+        curr_index += len + 1
 
         print frames.map{ |a| data[:frames][a][:name] }.join(';')
         puts " #{weight}"
@@ -85,9 +88,14 @@ module StackProf
       stacks = []
       max_x = 0
       max_y = 0
-      while len = raw.shift
+      curr_index = 0
+      while len = raw[curr_index]
+        curr_index += 1
+
         max_y = len if len > max_y
-        stack = raw.slice!(0, len+1)
+
+        stack = raw[curr_index, len+1]
+        curr_index += len+1
         stacks << stack
         max_x += stack.last
       end

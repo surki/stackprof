@@ -11,9 +11,11 @@
 #include <ruby/st.h>
 #include <ruby/io.h>
 #include <ruby/intern.h>
+#include <ruby/version.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include "vendor/uthash.h"
 
 #define BUF_SIZE 2048
 
@@ -23,6 +25,18 @@ typedef struct {
     st_table *edges;
     st_table *lines;
 } frame_data_t;
+
+typedef struct {
+    VALUE obj;
+    int num;
+    VALUE *frames;
+    int *lines_buffer;
+    int living;
+    VALUE flags;
+    VALUE klass;
+    size_t memsize;
+    UT_hash_handle hh;
+} allocation_info_t;
 
 static struct {
     int running;
@@ -43,6 +57,8 @@ static struct {
     size_t during_gc;
     st_table *frames;
 
+    allocation_info_t *frames_heap_live;
+    int heap_all;
     VALUE frames_buffer[BUF_SIZE];
     int lines_buffer[BUF_SIZE];
 } _stackprof;
@@ -50,12 +66,16 @@ static struct {
 static VALUE sym_object, sym_wall, sym_cpu, sym_custom, sym_name, sym_file, sym_line;
 static VALUE sym_samples, sym_total_samples, sym_missed_samples, sym_edges, sym_lines;
 static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_frames, sym_out, sym_aggregate;
-static VALUE sym_gc_samples, objtracer;
+static VALUE sym_gc_samples, objtracer, sym_heap, objtracer_newobj, objtracer_freeobj, sym_heap_all;
 static VALUE gc_hook;
 static VALUE rb_mStackProf;
+static size_t rvalue_size;
 
 static void stackprof_newobj_handler(VALUE, void*);
+static void stackprof_newobj_handler_heap(VALUE, void*);
+static void stackprof_freeobj_handler_heap(VALUE, void*);
 static void stackprof_signal_handler(int sig, siginfo_t* sinfo, void* ucontext);
+static void stackprof_process_sample(VALUE *frames_buffer, int *lines_buffer, int num);
 
 static VALUE
 stackprof_start(int argc, VALUE *argv, VALUE self)
@@ -63,7 +83,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     struct sigaction sa;
     struct itimerval timer;
     VALUE opts = Qnil, mode = Qnil, interval = Qnil, out = Qfalse;
-    int raw = 0, aggregate = 1;
+    int raw = 0, aggregate = 1, heap_all = 0;
 
     if (_stackprof.running)
 	return Qfalse;
@@ -79,6 +99,8 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
 	    raw = 1;
 	if (rb_hash_lookup2(opts, sym_aggregate, Qundef) == Qfalse)
 	    aggregate = 0;
+        if (RTEST(rb_hash_aref(opts, sym_heap_all)))
+	    heap_all = 1;
     }
     if (!RTEST(mode)) mode = sym_wall;
 
@@ -87,6 +109,10 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
 	_stackprof.overall_signals = 0;
 	_stackprof.overall_samples = 0;
 	_stackprof.during_gc = 0;
+    }
+
+    if (!_stackprof.frames_heap_live) {
+        _stackprof.frames_heap_live = NULL;
     }
 
     if (mode == sym_object) {
@@ -109,6 +135,12 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     } else if (mode == sym_custom) {
 	/* sampled manually */
 	interval = Qnil;
+    } else if (mode == sym_heap) {
+        objtracer_newobj = rb_tracepoint_new(Qnil, RUBY_INTERNAL_EVENT_NEWOBJ, stackprof_newobj_handler_heap, 0);
+        rb_tracepoint_enable(objtracer_newobj);
+
+        objtracer_freeobj = rb_tracepoint_new(Qnil, RUBY_INTERNAL_EVENT_FREEOBJ, stackprof_freeobj_handler_heap, 0);
+        rb_tracepoint_enable(objtracer_freeobj);
     } else {
 	rb_raise(rb_eArgError, "unknown profiler mode");
     }
@@ -119,8 +151,37 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     _stackprof.mode = mode;
     _stackprof.interval = interval;
     _stackprof.out = out;
+    _stackprof.heap_all = heap_all;
 
     return Qtrue;
+}
+
+static size_t
+get_object_size(VALUE obj)
+{
+    VALUE flags = RBASIC(obj)->flags;
+    VALUE klass = RBASIC_CLASS(obj);
+    size_t objsize = 0;
+
+    if (flags) {
+        switch (klass) {
+        case T_NONE:
+        case T_ICLASS:
+        case T_NODE:
+        case T_ZOMBIE:
+            break;
+
+        case T_CLASS:
+            if (FL_TEST(obj, FL_SINGLETON))
+                break;
+        default:
+            if (klass == 0 || rb_obj_is_kind_of(obj, klass)) {
+                objsize = rb_obj_memsize_of(obj);
+            }
+        }
+    }
+
+    return objsize + rvalue_size;
 }
 
 static VALUE
@@ -128,6 +189,7 @@ stackprof_stop(VALUE self)
 {
     struct sigaction sa;
     struct itimerval timer;
+    allocation_info_t *info, *tmp;
 
     if (!_stackprof.running)
 	return Qfalse;
@@ -145,6 +207,25 @@ stackprof_stop(VALUE self)
 	sigaction(_stackprof.mode == sym_wall ? SIGALRM : SIGPROF, &sa, NULL);
     } else if (_stackprof.mode == sym_custom) {
 	/* sampled manually */
+    } else if (_stackprof.mode == sym_heap) {
+        // Force GC to cleanup unreferenced live objects
+        rb_gc_start();
+
+        rb_tracepoint_disable(objtracer_newobj);
+        rb_tracepoint_disable(objtracer_freeobj);
+
+        HASH_ITER(hh, _stackprof.frames_heap_live, info, tmp) {
+            if (info->frames) {
+                if (info->living && !info->memsize) {
+                    info->memsize = 0; //get_object_size(info->obj);
+                }
+                stackprof_process_sample(info->frames, info->lines_buffer, info->num);
+            }
+            HASH_DEL(_stackprof.frames_heap_live, info);
+            free(info->frames);
+            free(info->lines_buffer);
+            free(info);
+        }
     } else {
 	rb_raise(rb_eArgError, "unknown profiler mode");
     }
@@ -342,11 +423,22 @@ st_numtable_increment(st_table *table, st_data_t key, size_t increment)
 void
 stackprof_record_sample()
 {
-    int num, i, n;
-    VALUE prev_frame = Qnil;
+    int num;
 
     _stackprof.overall_samples++;
     num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
+
+    if (_stackprof.mode == sym_heap)
+        return;
+
+    stackprof_process_sample(_stackprof.frames_buffer, _stackprof.lines_buffer, num);
+}
+
+void
+stackprof_process_sample(VALUE *frames_buffer, int *lines_buffer, int num)
+{
+    int i, n;
+    VALUE prev_frame = Qnil;
 
     if (_stackprof.raw) {
 	int found = 0;
@@ -363,7 +455,7 @@ stackprof_record_sample()
 
 	if (_stackprof.raw_samples_len > 0 && _stackprof.raw_samples[_stackprof.raw_sample_index] == (VALUE)num) {
 	    for (i = num-1, n = 0; i >= 0; i--, n++) {
-		VALUE frame = _stackprof.frames_buffer[i];
+		VALUE frame = frames_buffer[i];
 		if (_stackprof.raw_samples[_stackprof.raw_sample_index + 1 + n] != frame)
 		    break;
 	    }
@@ -377,7 +469,7 @@ stackprof_record_sample()
 	    _stackprof.raw_sample_index = _stackprof.raw_samples_len;
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)num;
 	    for (i = num-1; i >= 0; i--) {
-		VALUE frame = _stackprof.frames_buffer[i];
+		VALUE frame = frames_buffer[i];
 		_stackprof.raw_samples[_stackprof.raw_samples_len++] = frame;
 	    }
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)1;
@@ -385,8 +477,8 @@ stackprof_record_sample()
     }
 
     for (i = 0; i < num; i++) {
-	int line = _stackprof.lines_buffer[i];
-	VALUE frame = _stackprof.frames_buffer[i];
+	int line = lines_buffer[i];
+	VALUE frame = frames_buffer[i];
 	frame_data_t *frame_data = sample_for(frame);
 
 	frame_data->total_samples++;
@@ -442,6 +534,92 @@ stackprof_newobj_handler(VALUE tpval, void *data)
     stackprof_job_handler(0);
 }
 
+
+static void
+stackprof_newobj_handler_heap(VALUE tpval, void *data)
+{
+    allocation_info_t *info = NULL, *tmp = NULL;
+    rb_trace_arg_t *tparg = rb_tracearg_from_tracepoint(tpval);
+    VALUE obj = rb_tracearg_object(tparg);
+    int num, replace = 0;
+
+    _stackprof.overall_signals++;
+
+    if (RTEST(_stackprof.interval) && _stackprof.overall_signals % NUM2LONG(_stackprof.interval))
+	return;
+
+    _stackprof.overall_samples++;
+
+    HASH_FIND(hh, _stackprof.frames_heap_live, &obj, sizeof(VALUE), info);
+    if (!info) {
+        info = (allocation_info_t *)malloc(sizeof(allocation_info_t));
+    }
+    else {
+        free(info->frames);
+        free(info->lines_buffer);
+        replace = 1;
+    }
+
+    num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
+
+    info->obj = obj;
+
+    info->num = num;
+    info->living = 1;
+    info->flags = RBASIC(obj)->flags;
+    info->klass = RBASIC_CLASS(obj);
+
+    // We will not compute memory used here, we will do it later. It appears
+    // this trace callback is called before the object in question is
+    // populated.
+    info->memsize = 0;
+
+    info->frames = (VALUE *)malloc(sizeof(VALUE) * num);
+    MEMCPY(info->frames, _stackprof.frames_buffer, VALUE, num);
+
+    info->lines_buffer = (int *)malloc(sizeof(int) * num);
+    MEMCPY(info->lines_buffer, _stackprof.lines_buffer, int, num);
+
+    if (!replace) {
+        HASH_ADD(hh, _stackprof.frames_heap_live, obj, sizeof(VALUE), info);
+    }
+    else {
+        HASH_REPLACE(hh, _stackprof.frames_heap_live, obj, sizeof(VALUE), info, tmp);
+    }
+}
+
+
+static void
+stackprof_freeobj_handler_heap(VALUE tpval, void *data)
+{
+    rb_trace_arg_t *tparg = rb_tracearg_from_tracepoint(tpval);
+    VALUE obj = rb_tracearg_object(tparg);
+    allocation_info_t *info = NULL;
+
+    HASH_FIND(hh, _stackprof.frames_heap_live, &obj, sizeof(VALUE), info);
+    if (info) {
+        // If we are tracking all heap allocations, don't free the
+        // allocation info.
+        if (_stackprof.heap_all)
+        {
+            info->memsize = 0; //get_object_size(obj);
+            info->living = 0;
+        }
+        else
+        {
+            HASH_DEL(_stackprof.frames_heap_live, info);
+
+            free(info->frames);
+            free(info->lines_buffer);
+            free(info);
+
+            // We need to treat this as if we didn't really sample this
+            _stackprof.overall_signals--;
+            _stackprof.overall_samples--;
+        }
+    }
+}
+
 static VALUE
 stackprof_sample(VALUE self)
 {
@@ -464,11 +642,25 @@ frame_mark_i(st_data_t key, st_data_t val, st_data_t arg)
 static void
 stackprof_gc_mark(void *data)
 {
+    allocation_info_t *info, *tmp;
+    int i;
+
     if (RTEST(_stackprof.out))
 	rb_gc_mark(_stackprof.out);
 
     if (_stackprof.frames)
 	st_foreach(_stackprof.frames, frame_mark_i, 0);
+
+    if (_stackprof.frames_heap_live) {
+        HASH_ITER(hh, _stackprof.frames_heap_live, info, tmp) {
+            if (info->frames) {
+                for (i = 0; i < info->num; i++) {
+                    rb_gc_mark(info->frames[i]);
+                }
+            }
+        }
+        //st_foreach(_stackprof.frames_heap_live, heap_frame_mark_i, 0);
+    }
 }
 
 static void
@@ -500,17 +692,33 @@ stackprof_atfork_parent(void)
 static void
 stackprof_atfork_child(void)
 {
+    allocation_info_t *info, *tmp;
+
+    if (_stackprof.running) {
+        if (_stackprof.mode == sym_heap) {
+            HASH_ITER(hh, _stackprof.frames_heap_live, info, tmp) {
+                HASH_DEL(_stackprof.frames_heap_live, info);
+
+                free(info->frames);
+                free(info->lines_buffer);
+                free(info);
+            }
+        }
+    }
+
     stackprof_stop(rb_mStackProf);
 }
 
 void
 Init_stackprof(void)
 {
+    VALUE gc_constant;
 #define S(name) sym_##name = ID2SYM(rb_intern(#name));
     S(object);
     S(custom);
     S(wall);
     S(cpu);
+    S(heap);
     S(name);
     S(file);
     S(line);
@@ -527,6 +735,7 @@ Init_stackprof(void)
     S(out);
     S(frames);
     S(aggregate);
+    S(heap_all);
 #undef S
 
     gc_hook = Data_Wrap_Struct(rb_cObject, stackprof_gc_mark, NULL, &_stackprof);
@@ -539,6 +748,17 @@ Init_stackprof(void)
     rb_define_singleton_method(rb_mStackProf, "stop", stackprof_stop, 0);
     rb_define_singleton_method(rb_mStackProf, "results", stackprof_results, -1);
     rb_define_singleton_method(rb_mStackProf, "sample", stackprof_sample, 0);
+
+    // For Ruby <= 2.1.*, RVALUE size is not included when computing
+    // memsize_of(obj), so we will add it explicitly.
+    // TODO: is there a better way to check ruby version from the native
+    // gem?
+    rvalue_size = 0;
+    if (ruby_version[0] <= '2' && ruby_version[2] <= '1')
+    {
+        gc_constant = rb_const_get(rb_mGC, rb_intern("INTERNAL_CONSTANTS"));
+        rvalue_size = NUM2SIZET(rb_hash_aref(gc_constant, ID2SYM(rb_intern("RVALUE_SIZE"))));
+    }
 
     pthread_atfork(stackprof_atfork_prepare, stackprof_atfork_parent, stackprof_atfork_child);
 }

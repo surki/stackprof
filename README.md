@@ -100,6 +100,7 @@ four sampling modes are supported:
   - :wall (using `ITIMER_REAL` and `SIGALRM`)
   - :cpu (using `ITIMER_PROF` and `SIGPROF`) [default mode]
   - :object (using `RUBY_INTERNAL_EVENT_NEWOBJ`)
+  - :heap (for tracking heap usage using `RUBY_INTERNAL_EVENT_NEWOBJ` and `RUBY_INTERNAL_EVENT_FREEOBJ`)
   - :custom (user-defined via `StackProf.sample`)
 
 samplers have a tuneable interval which can be used to reduce overhead or increase granularity:
@@ -307,6 +308,77 @@ StackProf.stop
 StackProf.results('/tmp/some.file')
 ```
 
+### heap profiling
+
+the profiler can be used to trace object creations/memory allocations. This
+can be used to trace memory leaks and/or to optimize the number of live
+objects in the application.
+
+There are two kinds of usage supported:
+
+1. Dump all live objects' information (along with sampled callstack etc)
+   between two points
+
+```
+StackProf.start(mode: :heap, raw: true)
+#.....
+#.....
+StackProf.stop
+StackProf.results('/tmp/some.file')
+```
+
+Hint: if we want to analyze all the live objects in the application, we can
+include the `StackProf.start` call in rubygems.rb (for example in
+~/.rvm/rubies/ruby-2.1.10/lib/ruby/site_ruby/2.1.0/rubygems.rb)
+
+2. Dump all objects' information (including freed) between two points. This
+   can be used, for example, to trace object allocations for given
+   request/response and optimize the allocations.
+
+```
+StackProf.start(mode: :heap, raw: true, heap_all: true)
+#.....
+#.....
+StackProf.stop
+StackProf.results('/tmp/some.file')
+```
+
+Now to view the data
+
+```
+stackprof --text /tmp/some.file
+==================================
+  Mode: heap()
+  Samples: 3685147 (0.00% miss rate)
+  GC: 0 (0.00%)
+==================================
+     TOTAL    (pct)     SAMPLES    (pct)     FRAME
+   2000004  (54.3%)     2000004  (54.3%)     block in Object#myfunc4
+    150003   (4.1%)      150003   (4.1%)     block in Object#myfunc3
+    100002   (2.7%)      100002   (2.7%)     block in Object#myfunc2
+     50001   (1.4%)       50001   (1.4%)     block in Object#myfunc1
+   2300011  (62.4%)           1   (0.0%)     <main>
+   1200006  (32.6%)           0   (0.0%)     Object#myfunc2
+    650004  (17.6%)           0   (0.0%)     Object#myfunc1
+   1650006  (44.8%)           0   (0.0%)     Object#myfunc3
+   2300011  (62.4%)           0   (0.0%)     <main>
+   2000004  (54.3%)           0   (0.0%)     Object#myfunc4
+```
+
+Or to generate graphviz out of this dump
+
+```
+stackprof --graphviz /tmp/some.file > /tmp/x.dot && xdot /tmp/x.dot
+```
+
+or to generate flame graph out of this dump
+
+```
+stackprof --stackcollapse /tmp/some.file > /tmp/foldedstack.txt
+
+flamegraph.pl --colors=mem --countname=objects --title="Live heap dump" < /tmp/foldedstack.txt > /tmp/heap_dump.svg
+```
+
 ### all options
 
 `StackProf.run` accepts an options hash. Currently, the following options are recognized:
@@ -318,7 +390,7 @@ Option      | Meaning
 `interval`  | mode-relative sample rate [c.f.](#sampling)
 `aggregate` | defaults: `true` - if `false` disables [aggregation](#aggregation)
 `raw`       | defaults `false` - if `true` collects the extra data required by the `--flamegraph` and `--stackcollapse` report types
-
+`heap_all`  | defaults: `false` - if `true` collects information about all object allocations, not just ones that are currently alive
 ### todo
 
 * file/iseq blacklist
